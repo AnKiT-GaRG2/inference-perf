@@ -1,6 +1,7 @@
+import numpy as np
 import pytest
 from typing import Any, List
-from inference_perf.datagen.datagen_utils import converge_to_exact_length_text
+from inference_perf.datagen.datagen_utils import converge_to_exact_length_text, generate_random_exact_length_text
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 
 
@@ -106,3 +107,50 @@ def test_generate_exact_length_text_with_wrap_fn() -> None:
     assert tokenizer.count_tokens(result, add_special_tokens=False) == 5
     assert result == "<open> 10 20 30 <close>"
     assert ids == [10, 20, 30]
+
+
+POISON = 999
+
+
+class MergingCustomTokenizer(DummyCustomTokenizer):
+    """Mimics a BPE merge across a token boundary.
+
+    A token that follows POISON merges with it on re-tokenization, so the count
+    comes out one higher than the number of ids (the "N-1 / N+1" jump from
+    issue #1006). Appending to or trimming the same tail never escapes it.
+    """
+
+    def count_tokens(self, text: str, add_special_tokens: bool = True) -> int:
+        ids = [int(t) for t in text.split()]
+        return len(ids) + (1 if len(ids) >= 2 and ids[-2] == POISON else 0)
+
+
+class PoisonedStartRng:
+    """Real rng, except the first draw has POISON as its second-to-last token."""
+
+    def __init__(self, seed: int) -> None:
+        self._rng = np.random.default_rng(seed)
+        self._first = True
+
+    def choice(self, a: Any, size: int) -> Any:
+        out = self._rng.choice(a, size=size)
+        if self._first:
+            self._first = False
+            out[size - 2] = POISON
+        return out
+
+
+def test_generate_random_exact_length_text_escapes_merge_oscillation() -> None:
+    tokenizer = MergingCustomTokenizer()
+    valid_token_ids = np.arange(10, 500)
+    target_len = 8
+
+    text, ids = generate_random_exact_length_text(
+        PoisonedStartRng(0),  # type: ignore[arg-type]
+        valid_token_ids,
+        tokenizer,
+        target_len,
+    )
+
+    assert tokenizer.count_tokens(text) == target_len
+    assert POISON not in ids
